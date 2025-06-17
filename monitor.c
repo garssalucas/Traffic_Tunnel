@@ -1,63 +1,107 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <net/ethernet.h>
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
-#include <netinet/ip_icmp.h>
-#include <netpacket/packet.h>
-#include <net/if.h>
 #include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/ether.h>
+#include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <time.h>
 
-#define BUFFER_SIZE 65536
+#define BUFFER_SIZE 2048
+
+void get_datetime(char *buffer, int len) {
+	time_t now = time(NULL);
+	struct tm *t = localtime(&now);
+	strftime(buffer, len, "%Y-%m-%d %H:%M:%S", t);
+}
 
 int main() {
-    int raw_socket;
-    struct ifreq ifr;
-    char buffer[BUFFER_SIZE];
+	int fd;
+	struct ifreq ifr;
+	struct sockaddr_ll sa;
+	unsigned char buffer[BUFFER_SIZE];
+	unsigned long int contador = 0;
 
-    // Cria o raw socket
-    raw_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (raw_socket < 0) {
-        perror("Erro ao criar socket");
-        exit(1);
-    }
+	unsigned char mac_dst[6], mac_src[6];
+	unsigned short ethertype;
+	//unsigned char *data;
 
-    // Associa o socket à interface tun0
-    strcpy(ifr.ifr_name, "tun0");
-    if (ioctl(raw_socket, SIOCGIFINDEX, &ifr) < 0) {
-        perror("Erro ao obter índice da interface");
-        exit(1);
-    }
+	// Abre CSV da camada 2
+	FILE *log_camada2 = fopen("camada2.csv", "a");
+	if (!log_camada2) {
+		perror("Erro ao abrir camada2.csv");
+		exit(1);
+	}
 
-    struct sockaddr_ll sll = {0};
-    sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = ifr.ifr_ifindex;
-    sll.sll_protocol = htons(ETH_P_ALL);
+	// Cabeçalho do CSV
+	fprintf(log_camada2, "DataHora,MAC_Origem,MAC_Destino,EtherType,Tamanho\n");
+	fflush(log_camada2);
 
-    if (bind(raw_socket, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-        perror("Erro ao fazer bind no socket");
-        exit(1);
-    }
+	// Cria socket RAW
+	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if (fd < 0) {
+		perror("Erro ao criar socket RAW");
+		exit(1);
+	}
 
-    printf("Monitor de tráfego iniciado na interface tun0...\n");
+	// Associa à interface tun0
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, "tun0", IFNAMSIZ);
+	if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+		perror("Erro ao obter índice da interface");
+		exit(1);
+	}
 
-    // Loop para capturar pacotes
-    while (1) {
-        ssize_t num_bytes = recvfrom(raw_socket, buffer, BUFFER_SIZE, 0, NULL, NULL);
-        if (num_bytes < 0) {
-            perror("Erro ao receber pacote");
-            exit(1);
-        }
+	memset(&sa, 0, sizeof(sa));
+	sa.sll_family = AF_PACKET;
+	sa.sll_ifindex = ifr.ifr_ifindex;
+	sa.sll_protocol = htons(ETH_P_ALL);
 
-        printf("Pacote capturado: %ld bytes\n", num_bytes);
-    }
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		perror("Erro ao fazer bind");
+		exit(1);
+	}
 
-    close(raw_socket);
-    return 0;
+	printf("Monitorando tráfego na interface tun0 (Camada 2)...\n");
+
+	while (1) {
+		ssize_t bytes_recebidos = recvfrom(fd, buffer, BUFFER_SIZE, 0, NULL, NULL);
+		if (bytes_recebidos < 0) {
+			perror("Erro ao capturar pacote");
+			close(fd);
+			exit(1);
+		}
+
+		// Interpreta cabeçalho Ethernet
+		memcpy(mac_dst, buffer, sizeof(mac_dst));
+		memcpy(mac_src, buffer + sizeof(mac_dst), sizeof(mac_src));
+		memcpy(&ethertype, buffer + sizeof(mac_dst) + sizeof(mac_src), sizeof(ethertype));
+		ethertype = ntohs(ethertype);
+		//data = (buffer + sizeof(mac_dst) + sizeof(mac_src) + sizeof(ethertype));
+
+		// Data e hora
+		char datahora[64];
+		get_datetime(datahora, sizeof(datahora));
+
+		// Salva no CSV
+		fprintf(log_camada2, "%s,%02x:%02x:%02x:%02x:%02x:%02x,%02x:%02x:%02x:%02x:%02x:%02x,0x%04x,%ld\n",
+				datahora,
+				mac_src[0], mac_src[1], mac_src[2],
+				mac_src[3], mac_src[4], mac_src[5],
+				mac_dst[0], mac_dst[1], mac_dst[2],
+				mac_dst[3], mac_dst[4], mac_dst[5],
+				ethertype,
+				bytes_recebidos);
+		fflush(log_camada2);
+
+		contador++;
+		printf("\rQuadros capturados: %lu", contador);
+        fflush(stdout);
+	}
+
+	close(fd);
+	fclose(log_camada2);
+	return 0;
 }
